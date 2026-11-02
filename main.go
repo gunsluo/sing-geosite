@@ -295,7 +295,7 @@ func mergeTags(data map[string][]geosite.Item) {
 	println("merged cn categories: " + strings.Join(cnCodeList, ","))
 }
 
-func generate(release *github.RepositoryRelease, output string, cnOutput string, ruleSetOutput string, ruleSetUnstableOutput string) error {
+func generate(release *github.RepositoryRelease, output string, cnOutput string, ruleSetOutput string, ruleSetUnstableOutput string, textOutput string) error {
 	vData, err := download(release)
 	if err != nil {
 		return err
@@ -350,6 +350,12 @@ func generate(release *github.RepositoryRelease, output string, cnOutput string,
 	if err != nil {
 		return err
 	}
+	os.RemoveAll(textOutput)
+	err = os.MkdirAll(textOutput, 0o755)
+	if err != nil {
+		return err
+	}
+	var droppedCodes []string
 	for code, domains := range domainMap {
 		var headlessRule option.DefaultHeadlessRule
 		defaultRule := geosite.Compile(domains)
@@ -389,15 +395,53 @@ func generate(release *github.RepositoryRelease, output string, cnOutput string,
 		if err != nil {
 			return err
 		}
+		// mihomo domain list, converted to .mrs by the workflow.
+		// mrs cannot hold keyword / regex rules, so they are dropped.
+		if len(headlessRule.DomainKeyword)+len(headlessRule.DomainRegex) > 0 {
+			droppedCodes = append(droppedCodes, code)
+		}
+		err = writeDomainText(filepath.Join(textOutput, "geosite-"+code+".txt"), headlessRule)
+		if err != nil {
+			return err
+		}
 	}
+	sort.Strings(droppedCodes)
+	os.Stderr.WriteString("mrs dropped keyword/regex rules in " + strings.Join(droppedCodes, ",") + "\n")
 	return nil
 }
 
-func setActionOutput(name string, content string) {
-	os.Stdout.WriteString("::set-output name=" + name + "::" + content + "\n")
+func writeDomainText(path string, rule option.DefaultHeadlessRule) error {
+	lines := make([]string, 0, len(rule.Domain)+len(rule.DomainSuffix))
+	lines = append(lines, rule.Domain...)
+	for _, suffix := range rule.DomainSuffix {
+		if strings.HasPrefix(suffix, ".") {
+			// subdomains only, same as sing-box ".example.com"
+			lines = append(lines, suffix)
+		} else {
+			lines = append(lines, "+."+suffix)
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
-func release(source string, destination string, output string, cnOutput string, ruleSetOutput string, ruleSetOutputUnstable string) error {
+func setActionOutput(name string, content string) {
+	outputPath := os.Getenv("GITHUB_OUTPUT")
+	if outputPath == "" {
+		os.Stdout.WriteString("::set-output name=" + name + "::" + content + "\n")
+		return
+	}
+	file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	file.WriteString(name + "=" + content + "\n")
+}
+
+func release(source string, destination string, output string, cnOutput string, ruleSetOutput string, ruleSetOutputUnstable string, textOutput string) error {
 	sourceRelease, err := fetch(source)
 	if err != nil {
 		return err
@@ -412,7 +456,7 @@ func release(source string, destination string, output string, cnOutput string, 
 			return nil
 		}
 	}
-	err = generate(sourceRelease, output, cnOutput, ruleSetOutput, ruleSetOutputUnstable)
+	err = generate(sourceRelease, output, cnOutput, ruleSetOutput, ruleSetOutputUnstable, textOutput)
 	if err != nil {
 		return err
 	}
@@ -421,13 +465,18 @@ func release(source string, destination string, output string, cnOutput string, 
 }
 
 func main() {
+	destination := os.Getenv("GITHUB_REPOSITORY")
+	if destination == "" {
+		destination = "gunsluo/sing-geosite"
+	}
 	err := release(
 		"v2fly/domain-list-community",
-		"sagernet/sing-geosite",
+		destination,
 		"geosite.db",
 		"geosite-cn.db",
 		"rule-set",
 		"rule-set-unstable",
+		"rule-set-text",
 	)
 	if err != nil {
 		log.Fatal(err)
